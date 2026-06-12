@@ -355,16 +355,20 @@ def load_cookies(cookie_path: str) -> dict:
     if text.startswith("{"):
         return json.loads(text)
     for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
             continue
-        if "=" in line:
-            k, v = line.split("=", 1)
+        # Netscape 형식: domain \t flag \t path \t secure \t expiry \t name \t value
+        if "\t" in raw:
+            parts = raw.split("\t")
+            if len(parts) >= 7:
+                name, value = parts[5].strip(), parts[6].strip()
+                if name:
+                    cookies[name] = value
+            continue
+        if "=" in raw:
+            k, v = raw.split("=", 1)
             cookies[k.strip()] = v.strip()
-        elif "\t" in line:
-            parts = line.split("\t")
-            if len(parts) >= 2:
-                cookies[parts[0].strip()] = parts[1].strip()
     return cookies
 
 
@@ -732,6 +736,34 @@ def channel_download(
 #  카페 다운로드
 # ═══════════════════════════════════════════════════════════════════════════
 
+def cafe_resolve_grpid(
+    session: cffi_requests.Session,
+    cookies: dict,
+    grpid_or_name: str,
+) -> str:
+    """카페 vanity 이름(예: chlrbtlr) → 실제 grpid(예: zz4c) 해석.
+
+    이미 실제 grpid면 그대로 반환. 해석 실패 시 입력값 그대로 반환.
+    """
+    if not grpid_or_name:
+        return grpid_or_name
+    try:
+        resp = session.get(
+            f"https://cafe.daum.net/{grpid_or_name}",
+            cookies=cookies, timeout=15, allow_redirects=True,
+        )
+        if resp.status_code == 200:
+            m = re.search(r"grpid[=\"':\s]+([a-zA-Z0-9]{3,12})", resp.text)
+            if m:
+                resolved = m.group(1)
+                if resolved != grpid_or_name:
+                    log.info(f"grpid 해석: '{grpid_or_name}' → '{resolved}'")
+                return resolved
+    except Exception as e:
+        log.warning(f"grpid 해석 실패 ({grpid_or_name}): {e}")
+    return grpid_or_name
+
+
 def cafe_list_articles(
     session: cffi_requests.Session,
     cookies: dict,
@@ -739,8 +771,9 @@ def cafe_list_articles(
     page_start: int = 1,
     page_end: int = 999,
 ) -> list[dict]:
-    """카페 동영상 게시판에서 (fldid, dataid) 쌍 추출."""
-    articles = []
+    """카페 동영상 게시판에서 (fldid, dataid) 쌍 추출 (전 페이지 순회)."""
+    seen = set()
+    unique = []
     page = page_start
     while page <= page_end:
         resp = session.get(
@@ -751,23 +784,21 @@ def cafe_list_articles(
         if resp.status_code != 200:
             break
         pairs = re.findall(r"fldid:\s*'([^']+)'.*?dataid:\s*'(\d+)'", resp.text, re.DOTALL)
-        if not pairs:
+        if not pairs:  # 빈 페이지 = 마지막 도달
             break
+        new = 0
         for fldid, dataid in pairs:
-            articles.append({"fldid": fldid, "dataid": dataid})
-        log.info(f"카페 page {page}: {len(pairs)}건")
-        if f"page={page + 1}" not in resp.text:
+            k = f"{fldid}_{dataid}"
+            if k not in seen:
+                seen.add(k)
+                unique.append({"fldid": fldid, "dataid": dataid})
+                new += 1
+        log.info(f"카페 page {page}: {len(pairs)}건 (신규 {new}, 누적 {len(unique)})")
+        if new == 0:  # 새 글 없음 = 끝까지 봄
             break
         page += 1
         sleep_polite()
 
-    seen = set()
-    unique = []
-    for a in articles:
-        k = f"{a['fldid']}_{a['dataid']}"
-        if k not in seen:
-            seen.add(k)
-            unique.append(a)
     log.info(f"카페 총 {len(unique)}건 (중복 제거)")
     return unique
 
@@ -943,6 +974,7 @@ def cafe_download_all(
             progress_fn(s)
 
     session = _new_session()
+    grpid = cafe_resolve_grpid(session, cookies, grpid)
     _update("카페 목록 수집...")
     articles = cafe_list_articles(session, cookies, grpid)
     if not articles:
