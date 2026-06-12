@@ -30,7 +30,11 @@ import yt_dlp
 
 # ── 경로 ──────────────────────────────────────────────────────────────────
 
-ROOT = Path(__file__).resolve().parent
+# PyInstaller 빌드: sys.executable 기준, 일반 실행: __file__ 기준
+if getattr(sys, 'frozen', False):
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 DATA_DIR = ROOT / "data"
 
@@ -145,21 +149,38 @@ def classify_input(line: str) -> dict:
 #  Worker — 카카오TV 영상 (yt-dlp)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _download_single_video(url: str, update_fn):
+def _download_single_video(url: str, update_fn, max_retries: int = 5):
     """yt-dlp로 단일 영상 다운로드 + HTML 생성."""
-    # 메타데이터
+    # 메타데이터 (서버 오류 시 재시도)
     update_fn("메타데이터 수집...")
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info is None:
-            logger.warning("메타 실패: extract_info returned None")
-            update_fn("실패 (메타)")
-            return False
-    except Exception as e:
-        logger.warning(f"메타 에러: {e}")
-        update_fn("실패 (메타)")
-        return False
+    info = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info is not None:
+                break
+            if attempt < max_retries:
+                wait = 2 ** attempt + random.uniform(0, 2)
+                logger.warning(f"메타 None 반환, 재시도 {attempt}/{max_retries} ({wait:.0f}s 대기)")
+                update_fn(f"메타 재시도 {attempt}/{max_retries}...")
+                time.sleep(wait)
+            else:
+                logger.warning("메타 실패: extract_info returned None")
+                update_fn("실패 (메타)")
+                return False
+        except Exception as e:
+            err_str = str(e)
+            is_server_error = any(code in err_str for code in ["502", "503", "429", "500"])
+            if is_server_error and attempt < max_retries:
+                wait = 2 ** attempt + random.uniform(0, 2)
+                logger.warning(f"메타 에러 (재시도 {attempt}/{max_retries}, {wait:.0f}s 대기): {e}")
+                update_fn(f"메타 재시도 {attempt}/{max_retries}...")
+                time.sleep(wait)
+            else:
+                logger.warning(f"메타 에러: {e}")
+                update_fn("실패 (메타)")
+                return False
 
     vid = str(info.get("id",""))
     cid = info.get("uploader_id") or info.get("channel_id") or "unknown"
