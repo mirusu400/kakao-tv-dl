@@ -146,87 +146,233 @@ def classify_input(line: str) -> dict:
     return {"type": "search", "query": line}
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Worker — 카카오TV 영상 (yt-dlp)
+#  Worker — 카카오TV 영상 (직접 API + curl_cffi)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _download_single_video(url: str, update_fn, max_retries: int = 5):
-    """yt-dlp로 단일 영상 다운로드 + HTML 생성."""
-    # 메타데이터 (서버 오류 시 재시도)
-    update_fn("메타데이터 수집...")
-    info = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info is not None:
-                break
-            if attempt < max_retries:
-                wait = 2 ** attempt + random.uniform(0, 2)
-                logger.warning(f"메타 None 반환, 재시도 {attempt}/{max_retries} ({wait:.0f}s 대기)")
-                update_fn(f"메타 재시도 {attempt}/{max_retries}...")
-                time.sleep(wait)
-            else:
-                logger.warning("메타 실패: extract_info returned None")
-                update_fn("실패 (메타)")
-                return False
-        except Exception as e:
-            err_str = str(e)
-            is_server_error = any(code in err_str for code in ["502", "503", "429", "500"])
-            if is_server_error and attempt < max_retries:
-                wait = 2 ** attempt + random.uniform(0, 2)
-                logger.warning(f"메타 에러 (재시도 {attempt}/{max_retries}, {wait:.0f}s 대기): {e}")
-                update_fn(f"메타 재시도 {attempt}/{max_retries}...")
-                time.sleep(wait)
-            else:
-                logger.warning(f"메타 에러: {e}")
-                update_fn("실패 (메타)")
-                return False
+_PLAYMETA_URL = "http://tv.kakao.com/api/v1/ft/playmeta/cliplink/%s/"
+_CDN_URL = "https://tv.kakao.com/katz/v1/ft/cliplink/%s/readyNplay"
+# 프로필 우선순위: 고화질 → 저화질
+_PROFILE_PREF = ["HIGH4", "HIGH", "MAIN", "BASE", "LOW"]
 
-    vid = str(info.get("id",""))
-    cid = info.get("uploader_id") or info.get("channel_id") or "unknown"
-    title = info.get("title","")
+def _fetch_kakao_meta(vid: str, url: str) -> dict | None:
+    """playmeta API로 메타데이터 가져오기 (안정적, 502 안 남)."""
+    session = cffi_requests.Session(impersonate="chrome")
+    params = {
+        "player": "monet_html5",
+        "referer": url,
+        "uuid": "",
+        "service": "kakao_tv",
+        "section": "",
+        "dteType": "PC",
+        "fields": ",".join([
+            "-*", "tid", "clipLink", "displayTitle", "clip", "title",
+            "description", "channelId", "createTime", "duration", "playCount",
+            "likeCount", "commentCount", "tagList", "channel", "name",
+            "clipChapterThumbnailList", "thumbnailUrl", "timeInSec", "isDefault",
+            "videoOutputList", "width", "height", "kbps", "profile", "label",
+        ]),
+    }
+    for attempt in range(3):
+        try:
+            r = session.get(_PLAYMETA_URL % vid, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code >= 500 and attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+                continue
+            return None
+        except Exception:
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+            continue
+    return None
+
+def _find_stream_url(vid: str, url: str, profiles: list[str]) -> tuple[str | None, str | None]:
+    """CDN에서 스트림 URL 찾기. 모든 프로필 순회, 재시도 포함."""
+    session = cffi_requests.Session(impersonate="chrome")
+    params_base = {
+        "player": "monet_html5",
+        "referer": url,
+        "uuid": "",
+        "service": "kakao_tv",
+        "section": "",
+        "dteType": "PC",
+        "fields": "-*,code,message,url",
+    }
+    # 화질 우선순위에 따라 정렬
+    ordered = sorted(profiles, key=lambda p: _PROFILE_PREF.index(p) if p in _PROFILE_PREF else 99)
+    for profile in ordered:
+        params = {**params_base, "profile": profile}
+        for attempt in range(3):
+            try:
+                r = session.get(_CDN_URL % vid, params=params, timeout=15)
+                if r.status_code == 200:
+                    stream_url = r.json().get("videoLocation", {}).get("url")
+                    if stream_url:
+                        return stream_url, profile
+                if r.status_code >= 500 and attempt < 2:
+                    time.sleep(2 + random.uniform(0, 2))
+                    continue
+                break  # 4xx 등은 다음 프로필로
+            except Exception:
+                if attempt < 2:
+                    time.sleep(2)
+                continue
+    return None, None
+
+def _download_stream(stream_url: str, dest: Path) -> bool:
+    """스트림 URL에서 mp4 직접 다운로드."""
+    session = cffi_requests.Session(impersonate="chrome")
+    try:
+        r = session.get(stream_url, stream=True, timeout=600)
+        if r.status_code not in (200, 206):
+            return False
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(256 * 1024):
+                if chunk:
+                    f.write(chunk)
+        return dest.stat().st_size > 1024  # 최소 1KB
+    except Exception as e:
+        logger.warning(f"  스트림 다운로드 에러: {e}")
+        return False
+
+def _download_single_video(url: str, update_fn, max_retries: int = 5):
+    """카카오TV 영상 다운로드 + HTML 생성 (직접 API 사용)."""
+    # URL에서 video ID 추출
+    m = re.search(r"(?:/v/|/cliplink/)(\d+)", url)
+    if not m:
+        logger.warning(f"URL에서 ID 추출 실패: {url}")
+        update_fn("실패 (URL)")
+        return False
+    vid = m.group(1)
+
+    # 1) 메타데이터 (playmeta — 안정적)
+    update_fn("메타데이터 수집...")
+    meta = _fetch_kakao_meta(vid, url)
+    if not meta:
+        logger.warning(f"메타 실패: {vid}")
+        update_fn("실패 (메타)")
+        return False
+
+    clip_link = meta.get("clipLink", {})
+    clip = clip_link.get("clip", {})
+    title = clip.get("title") or clip_link.get("displayTitle") or ""
+    cid = str(clip_link.get("channelId") or "unknown")
+    channel_name = (clip_link.get("channel") or {}).get("name", "")
+    duration = clip.get("duration")
+    upload_date = clip_link.get("createTime", "")
+
     update_fn(f"다운로드: {title[:30]}...")
 
-    output = str(DATA_DIR / f"{cid}/{vid}/video.%(ext)s")
-    fmt = f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/best[height<={MAX_HEIGHT}]/best"
-    ydl_opts = {
-        "format": fmt,
-        "writeinfojson": True,
-        "writethumbnail": True,
-        "writedescription": True,
-        "merge_output_format": "mp4",
-        "nooverwrites": True,
-        "continuedl": True,
-        "retries": 5,
-        "fragment_retries": 10,
-        "outtmpl": output,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        logger.warning(f"다운로드 실패: {e}")
+    video_dir = DATA_DIR / cid / vid
+    video_dir.mkdir(parents=True, exist_ok=True)
+    mp4_path = video_dir / "video.mp4"
+
+    # 이미 있으면 스킵
+    if mp4_path.exists() and mp4_path.stat().st_size > 1024:
+        logger.info(f"  이미 존재: {vid}")
+        update_fn("완료 (스킵)")
+        # HTML만 생성
+        _save_meta_and_html(video_dir, vid, clip_link, clip, url)
+        return True
+
+    # 2) 스트림 URL 찾기 (모든 프로필 순회)
+    available_profiles = [
+        f.get("profile") for f in clip.get("videoOutputList", [])
+        if f.get("profile") and f.get("profile") != "AUDIO"
+    ]
+    if not available_profiles:
+        logger.warning(f"  프로필 없음: {vid}")
+        update_fn("실패 (프로필 없음)")
+        return False
+
+    # 화질 제한 적용
+    height_map = {}
+    for f in clip.get("videoOutputList", []):
+        p = f.get("profile")
+        h = f.get("height", 0)
+        if p:
+            height_map[p] = h
+    filtered = [p for p in available_profiles if height_map.get(p, 0) <= MAX_HEIGHT] or available_profiles
+
+    stream_url, profile = _find_stream_url(vid, url, filtered)
+    if not stream_url:
+        logger.warning(f"  CDN 502: 모든 프로필 실패 ({vid})")
+        update_fn("실패 (CDN 502)")
+        # 메타데이터라도 저장
+        _save_meta_and_html(video_dir, vid, clip_link, clip, url)
+        return False
+
+    height = height_map.get(profile, "?")
+    logger.info(f"  스트림: {profile} ({height}p)")
+    update_fn(f"다운로드 중: {title[:25]}... ({height}p)")
+
+    # 3) 직접 다운로드
+    if not _download_stream(stream_url, mp4_path):
+        logger.warning(f"  다운로드 실패: {vid}")
         update_fn("실패 (다운로드)")
         return False
 
-    # HTML 생성
-    video_dir = DATA_DIR / cid / vid
-    if video_dir.exists():
-        ud = info.get("upload_date","")
-        _build_html(video_dir, {
-            "title": title,
-            "channel": info.get("uploader") or info.get("channel",""),
-            "duration": info.get("duration",0),
-            "upload_date": ud,
-            "description": info.get("description",""),
-            "webpage_url": info.get("webpage_url", url),
-        })
+    # 4) 메타/썸네일/HTML 저장
+    _save_meta_and_html(video_dir, vid, clip_link, clip, url)
+
+    # 썸네일 다운로드
+    thumb_url = clip.get("thumbnailUrl")
+    if thumb_url:
+        try:
+            session = cffi_requests.Session(impersonate="chrome")
+            tr = session.get(thumb_url, timeout=15)
+            if tr.status_code == 200:
+                ext = ".png" if ".png" in thumb_url else ".jpg"
+                (video_dir / f"thumb{ext}").write_bytes(tr.content)
+        except Exception:
+            pass
 
     update_fn("완료")
     logger.info(f"완료: {title}")
     return True
+
+def _save_meta_and_html(video_dir: Path, vid: str, clip_link: dict, clip: dict, url: str):
+    """info.json + video.html 저장."""
+    title = clip.get("title") or clip_link.get("displayTitle") or ""
+    channel_name = (clip_link.get("channel") or {}).get("name", "")
+    cid = str(clip_link.get("channelId") or "unknown")
+    duration = clip.get("duration", 0)
+    create_time = clip_link.get("createTime", "")
+    # upload_date: "2023-01-15T12:00:00+09:00" → "20230115"
+    ud = re.sub(r"[^0-9]", "", create_time[:10]) if create_time else ""
+
+    # info.json
+    info = {
+        "id": vid,
+        "title": title,
+        "channel": channel_name,
+        "channel_id": cid,
+        "duration": duration,
+        "upload_date": ud,
+        "view_count": clip.get("playCount"),
+        "like_count": clip.get("likeCount"),
+        "description": clip.get("description", ""),
+        "webpage_url": url,
+        "thumbnail": clip.get("thumbnailUrl"),
+        "formats": [
+            {"profile": f.get("profile"), "width": f.get("width"), "height": f.get("height")}
+            for f in clip.get("videoOutputList", []) if f.get("profile") != "AUDIO"
+        ],
+    }
+    (video_dir / "video.info.json").write_text(
+        json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # HTML
+    _build_html(video_dir, {
+        "title": title,
+        "channel": channel_name,
+        "duration": duration or 0,
+        "upload_date": ud,
+        "description": clip.get("description", ""),
+        "webpage_url": url,
+    })
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Worker — 카카오TV 검색
@@ -235,8 +381,7 @@ def _download_single_video(url: str, update_fn, max_retries: int = 5):
 def _search_and_download(query: str, update_fn, stop_event: threading.Event):
     from urllib.parse import quote
     session = cffi_requests.Session(impersonate="chrome")
-    session.headers.update({"x-requested-with": "XMLHttpRequest"})
-    session.headers["referer"] = f"https://tv.kakao.com/search/cliplinks?q={quote(query)}"
+    referer = f"https://tv.kakao.com/search/cliplinks?q={quote(query)}"
 
     update_fn(f"검색: {query}")
     page = 1
@@ -247,7 +392,9 @@ def _search_and_download(query: str, update_fn, stop_event: threading.Event):
                   "fields":"-user,-clipChapterThumbnailList,-tagList",
                   "size":20,"page":page,"_":int(time.time()*1000)}
         try:
-            resp = session.get(SEARCH_URL, params=params, timeout=30)
+            resp = session.get(SEARCH_URL, params=params,
+                               headers={"x-requested-with": "XMLHttpRequest", "referer": referer},
+                               timeout=30)
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
