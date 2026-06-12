@@ -16,7 +16,6 @@ import os
 import queue
 import random
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -27,6 +26,7 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 from curl_cffi import requests as cffi_requests
 import yaml
+import yt_dlp
 
 # ── 경로 ──────────────────────────────────────────────────────────────────
 
@@ -150,13 +150,12 @@ def _download_single_video(url: str, update_fn):
     # 메타데이터
     update_fn("메타데이터 수집...")
     try:
-        proc = subprocess.run(["yt-dlp","--skip-download","-J",url],
-            capture_output=True, text=True, timeout=60)
-        if proc.returncode != 0:
-            logger.warning(f"메타 실패: {proc.stderr[:120]}")
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info is None:
+            logger.warning("메타 실패: extract_info returned None")
             update_fn("실패 (메타)")
             return False
-        info = json.loads(proc.stdout)
     except Exception as e:
         logger.warning(f"메타 에러: {e}")
         update_fn("실패 (메타)")
@@ -169,21 +168,26 @@ def _download_single_video(url: str, update_fn):
 
     output = str(DATA_DIR / f"{cid}/{vid}/video.%(ext)s")
     fmt = f"bestvideo[height<={MAX_HEIGHT}]+bestaudio/best[height<={MAX_HEIGHT}]/best"
-    cmd = [
-        "yt-dlp", "-f", fmt,
-        "--write-info-json","--write-thumbnail","--write-description",
-        "--merge-output-format","mp4","--no-overwrites","--continue",
-        "--retries","5","--fragment-retries","10",
-        "-o", output, url,
-    ]
+    ydl_opts = {
+        "format": fmt,
+        "writeinfojson": True,
+        "writethumbnail": True,
+        "writedescription": True,
+        "merge_output_format": "mp4",
+        "nooverwrites": True,
+        "continuedl": True,
+        "retries": 5,
+        "fragment_retries": 10,
+        "outtmpl": output,
+        "quiet": True,
+        "no_warnings": True,
+    }
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode != 0 and "has already been recorded" not in (proc.stdout+proc.stderr):
-            logger.warning(f"다운로드 실패: {proc.stderr[-200:]}")
-            update_fn("실패 (다운로드)")
-            return False
-    except subprocess.TimeoutExpired:
-        update_fn("실패 (타임아웃)")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        logger.warning(f"다운로드 실패: {e}")
+        update_fn("실패 (다운로드)")
         return False
 
     # HTML 생성
@@ -278,12 +282,11 @@ def _search_and_download(query: str, update_fn, stop_event: threading.Event):
 def _channel_download(url: str, update_fn, stop_event: threading.Event):
     update_fn("채널 펼침...")
     try:
-        proc = subprocess.run(["yt-dlp","--flat-playlist","-J",url],
-            capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
+            data = ydl.extract_info(url, download=False)
+        if data is None:
             update_fn("실패 (채널 로드)")
             return 0
-        data = json.loads(proc.stdout)
     except Exception as e:
         update_fn(f"실패: {e}")
         return 0
