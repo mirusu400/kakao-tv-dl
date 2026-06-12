@@ -39,7 +39,7 @@ DATA_DIR = ROOT / "data"
 def _load_config() -> dict:
     p = ROOT / "config.yaml"
     if p.exists():
-        with open(p) as f:
+        with open(p, encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
     return {}
 
