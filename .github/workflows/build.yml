@@ -1,0 +1,96 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: kakao-tv-dl-linux
+            pyinstaller_args: ""
+          - os: macos-latest
+            artifact: kakao-tv-dl-macos
+            pyinstaller_args: ""
+          - os: windows-latest
+            artifact: kakao-tv-dl-windows
+            pyinstaller_args: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Set separator
+        id: sep
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "sep=;" >> "$GITHUB_OUTPUT"
+          else
+            echo "sep=:" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Build with PyInstaller
+        run: >-
+          pyinstaller --onefile --windowed
+          --name "${{ matrix.artifact }}"
+          --add-data "config.yaml${{ steps.sep.outputs.sep }}."
+          --hidden-import curl_cffi
+          --hidden-import curl_cffi.requests
+          --hidden-import _cffi_backend
+          --collect-all curl_cffi
+          gui.py
+        shell: bash
+
+      - name: Verify build
+        run: ls -lh dist/
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}*
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts
+        run: find artifacts/ -type f | head -20
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/kakao-tv-dl-linux/*
+            artifacts/kakao-tv-dl-macos/*
+            artifacts/kakao-tv-dl-windows/*

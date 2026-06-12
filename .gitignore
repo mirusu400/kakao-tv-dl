@@ -1,0 +1,12 @@
+data/
+site/
+state/_debug_*
+.venv/
+__pycache__/
+*.pyc
+.env
+ia.ini
+*.credentials
+cookies.txt
+
+state/

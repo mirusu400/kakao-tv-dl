@@ -1,0 +1,4 @@
+# 카카오TV 채널/플레이리스트/영상 URL을 한 줄에 하나씩 입력
+# 예시:
+# https://tv.kakao.com/channel/123456
+# https://tv.kakao.com/v/456789

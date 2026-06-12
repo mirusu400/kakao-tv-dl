@@ -1,0 +1,7 @@
+yt-dlp
+internetarchive
+jinja2
+pyyaml
+tqdm
+requests
+curl_cffi
