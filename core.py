@@ -13,6 +13,7 @@ import logging
 import mimetypes
 import random
 import re
+import sqlite3
 import sys
 import time
 import threading
@@ -57,6 +58,136 @@ MAX_HEIGHT = CFG.get("quality", {}).get("max_height", 1080)
 EXCLUDE_CHANNELS = set(CFG.get("exclude", {}).get("channels", []))
 EXCLUDE_KEYWORDS = [kw.lower() for kw in CFG.get("exclude", {}).get("keywords", ["뉴스", "news"])]
 SEARCH_CFG = CFG.get("search", {})
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DB — 다운로드 이력 (sqlite3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DB_PATH = STATE_DIR / "history.db"
+_db_lock = threading.Lock()
+
+
+def _get_db() -> sqlite3.Connection:
+    """DB 연결 반환. 테이블 없으면 생성."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS downloads (
+            video_id   TEXT PRIMARY KEY,
+            source     TEXT,
+            title      TEXT,
+            channel_id TEXT,
+            channel    TEXT,
+            status     TEXT DEFAULT 'done',
+            path       TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status)
+    """)
+    conn.commit()
+    return conn
+
+
+def db_is_done(video_id: str) -> bool:
+    """이미 다운로드 완료된 영상인지 확인."""
+    _ensure_migrated()
+    with _db_lock:
+        conn = _get_db()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM downloads WHERE video_id=? AND status='done'",
+                (str(video_id),),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+
+def db_mark_done(video_id: str, source: str = "kakaotv",
+                 title: str = "", channel_id: str = "",
+                 channel: str = "", path: str = ""):
+    """다운로드 완료 기록."""
+    with _db_lock:
+        conn = _get_db()
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO downloads
+                    (video_id, source, title, channel_id, channel, status, path)
+                VALUES (?, ?, ?, ?, ?, 'done', ?)
+            """, (str(video_id), source, title, channel_id, channel, path))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_mark_failed(video_id: str, source: str = "kakaotv",
+                   title: str = "", channel_id: str = "",
+                   channel: str = ""):
+    """다운로드 실패 기록 (재시도 시 다시 시도됨)."""
+    with _db_lock:
+        conn = _get_db()
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO downloads
+                    (video_id, source, title, channel_id, channel, status, path)
+                VALUES (?, ?, ?, ?, ?, 'failed', '')
+            """, (str(video_id), source, title, channel_id, channel))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def db_migrate_old_files():
+    """기존 done_download.txt / cafe_done.txt → DB 마이그레이션. 1회만."""
+    archive = STATE_DIR / "done_download.txt"
+    if archive.exists():
+        with _db_lock:
+            conn = _get_db()
+            try:
+                with open(archive) as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        vid = parts[1] if len(parts) >= 2 else parts[0] if parts else ""
+                        if vid:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO downloads (video_id, source, status)
+                                VALUES (?, 'kakaotv', 'done')
+                            """, (vid,))
+                conn.commit()
+            finally:
+                conn.close()
+        archive.rename(archive.with_suffix(".txt.migrated"))
+        log.info(f"done_download.txt → DB 마이그레이션 완료")
+
+    cafe_done = CAFE_DONE_FILE
+    if cafe_done.exists():
+        with _db_lock:
+            conn = _get_db()
+            try:
+                with open(cafe_done) as f:
+                    for line in f:
+                        vid = line.strip()
+                        if vid:
+                            conn.execute("""
+                                INSERT OR IGNORE INTO downloads (video_id, source, status)
+                                VALUES (?, 'cafe', 'done')
+                            """, (vid,))
+                conn.commit()
+            finally:
+                conn.close()
+        cafe_done.rename(cafe_done.with_suffix(".txt.migrated"))
+        log.info(f"cafe_done.txt → DB 마이그레이션 완료")
+
+
+_migrated = False
+
+def _ensure_migrated():
+    global _migrated
+    if not _migrated:
+        _migrated = True
+        db_migrate_old_files()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  상수
@@ -118,6 +249,52 @@ def make_video_url(clip_id, channel_id=None) -> str:
 def extract_video_id(url: str) -> str | None:
     m = re.search(r"(?:/v/|/cliplink/)(\d+)", url)
     return m.group(1) if m else None
+
+
+def _safe_name(s: str, max_len: int = 80) -> str:
+    """파일시스템에 안전한 이름으로 변환."""
+    if not s:
+        return ""
+    # Windows/Mac/Linux 공통 금지 문자 제거
+    s = re.sub(r'[\\/:*?"<>|]', '_', s)
+    # 제어 문자 제거
+    s = re.sub(r'[\x00-\x1f]', '', s)
+    # 앞뒤 공백/마침표 제거 (Windows 문제)
+    s = s.strip().strip('.')
+    # 길이 제한
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def make_channel_dir(channel_id: str, channel_name: str = "") -> str:
+    """채널 폴더명: [<channel_id>]_<safe_channel_name>"""
+    cid = channel_id or "unknown"
+    name = _safe_name(channel_name)
+    if name:
+        return f"[{cid}]_{name}"
+    return f"[{cid}]"
+
+
+def make_video_dir(video_id: str, video_title: str = "") -> str:
+    """영상 폴더명: [<video_id>]_<safe_video_name>"""
+    vid = video_id or "unknown"
+    name = _safe_name(video_title)
+    if name:
+        return f"[{vid}]_{name}"
+    return f"[{vid}]"
+
+
+def get_video_path(channel_id: str, channel_name: str,
+                   video_id: str, video_title: str) -> Path:
+    """data/ 하위 영상 디렉토리 경로 반환. 기존(ID만) 폴더가 있으면 그쪽 사용."""
+    # 새 경로
+    new_path = DATA_DIR / make_channel_dir(channel_id, channel_name) / make_video_dir(video_id, video_title)
+    # 기존(ID만) 경로 — 호환성
+    old_path = DATA_DIR / (channel_id or "unknown") / video_id
+    if old_path.exists() and not new_path.exists():
+        return old_path
+    return new_path
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -331,6 +508,12 @@ def download_single_video(
         _update("실패 (URL)")
         return False
 
+    # DB 중복 체크
+    if db_is_done(vid):
+        log.info(f"DB 스킵: {vid}")
+        _update("완료 (DB 스킵)")
+        return True
+
     # 1) 메타데이터
     _update("메타데이터 수집...")
     meta = fetch_kakao_meta(vid, url)
@@ -343,10 +526,11 @@ def download_single_video(
     clip = clip_link.get("clip", {})
     title = clip.get("title") or clip_link.get("displayTitle") or ""
     cid = str(clip_link.get("channelId") or "unknown")
+    channel_name = (clip_link.get("channel") or {}).get("name", "")
 
     _update(f"다운로드: {title[:30]}...")
 
-    video_dir = DATA_DIR / cid / vid
+    video_dir = get_video_path(cid, channel_name, vid, title)
     video_dir.mkdir(parents=True, exist_ok=True)
     mp4_path = video_dir / "video.mp4"
 
@@ -394,6 +578,11 @@ def download_single_video(
     if thumb_url:
         ext = ".png" if ".png" in thumb_url else ".jpg"
         download_file(thumb_url, video_dir / f"thumb{ext}")
+
+    # DB 기록
+    db_mark_done(vid, source="kakaotv", title=title,
+                 channel_id=cid, channel=channel_name,
+                 path=str(video_dir.relative_to(DATA_DIR)))
 
     _update("완료")
     log.info(f"완료: {title}")
@@ -605,6 +794,11 @@ def cafe_download_article(
 
     clip_id, ptoken = clips[0], ptokens[0]
 
+    # DB 중복 체크
+    if db_is_done(clip_id):
+        log.info(f"  [{dataid}] DB 스킵: {clip_id}")
+        return True
+
     # 메타데이터
     meta = {}
     try:
@@ -685,7 +879,8 @@ def cafe_download_article(
     # 다운로드
     cid = meta.get("channel_id", "cafe")
     vid = str(meta.get("real_id") or clip_id)
-    video_dir = DATA_DIR / cid / vid
+    channel_name = meta.get("channel", "")
+    video_dir = get_video_path(cid, channel_name, vid, title)
     video_dir.mkdir(parents=True, exist_ok=True)
     mp4_path = video_dir / "video.mp4"
 
@@ -728,6 +923,11 @@ def cafe_download_article(
         "webpage_url": article_url,
     })
 
+    # DB 기록
+    db_mark_done(clip_id, source="cafe", title=title,
+                 channel_id=cid, channel=channel_name,
+                 path=str(video_dir.relative_to(DATA_DIR)))
+
     return True
 
 
@@ -749,10 +949,6 @@ def cafe_download_all(
         _update("실패: 게시글 없음")
         return 0
 
-    done_ids = set()
-    if CAFE_DONE_FILE.exists():
-        done_ids = set(CAFE_DONE_FILE.read_text().splitlines())
-
     success = 0
     for i, art in enumerate(articles):
         if stop_event and stop_event.is_set():
@@ -760,31 +956,9 @@ def cafe_download_all(
         fldid, dataid = art["fldid"], art["dataid"]
         _update(f"[{i + 1}/{len(articles)}] 게시글 {dataid}...")
 
-        # done 체크 위해 게시글에서 clip_id 확인
-        resp = session.get(
-            f"https://cafe.daum.net/_c21_/bbs_read?grpid={grpid}&fldid={fldid}&datanum={dataid}",
-            cookies=cookies, timeout=15,
-        )
-        if resp.status_code == 200:
-            clips_found = re.findall(r'cliplink/([a-zA-Z0-9]+)', resp.text)
-            if clips_found and clips_found[0] in done_ids:
-                log.info(f"  [{dataid}] 이미 완료")
-                continue
-
+        # cafe_download_article 내부에서 DB 중복 체크 + 완료 기록 처리
         ok = cafe_download_article(session, cookies, grpid, fldid, dataid)
         if ok:
-            # clip_id 기록
-            resp2 = session.get(
-                f"https://cafe.daum.net/_c21_/bbs_read?grpid={grpid}&fldid={fldid}&datanum={dataid}",
-                cookies=cookies, timeout=15,
-            )
-            if resp2.status_code == 200:
-                clips_found = re.findall(r'cliplink/([a-zA-Z0-9]+)', resp2.text)
-                if clips_found:
-                    CAFE_DONE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    with open(CAFE_DONE_FILE, "a") as f:
-                        f.write(clips_found[0] + "\n")
-                    done_ids.add(clips_found[0])
             success += 1
             log.info(f"  [{dataid}] 완료")
         sleep_polite()

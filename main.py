@@ -42,7 +42,6 @@ from core import (
 
 URLS_FILE = STATE_DIR / "urls.jsonl"
 CATALOG_FILE = STATE_DIR / "catalog.jsonl"
-ARCHIVE_FILE = STATE_DIR / "done_download.txt"
 
 # ── 로깅 ────────────────────────────────────────────────────────────────
 
@@ -324,25 +323,9 @@ def stage_metadata(args):
 #  STAGE 3 — DOWNLOAD (직접 API, yt-dlp 불필요)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _load_archive_ids() -> set:
-    ids = set()
-    if ARCHIVE_FILE.exists():
-        with open(ARCHIVE_FILE) as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 2:
-                    ids.add(parts[1])
-                elif parts:
-                    ids.add(parts[0])
-    return ids
-
-def _mark_archive(vid: str):
-    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(ARCHIVE_FILE, "a") as f:
-        f.write(f"kakao {vid}\n")
-
-
 def stage_download(args):
+    from core import db_is_done
+
     log.info("=" * 60)
     log.info("STAGE 3 — 다운로드")
     log.info("=" * 60)
@@ -353,13 +336,14 @@ def stage_download(args):
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     entries = load_jsonl(URLS_FILE)
-    archive_ids = _load_archive_ids()
 
-    todo = [e for e in entries if str(e.get("id", "")) not in archive_ids]
+    # DB 기반 중복 필터링
+    todo = [e for e in entries if not db_is_done(str(e.get("id", "")))]
+    already = len(entries) - len(todo)
     if args.limit:
         todo = todo[:args.limit]
 
-    log.info(f"전체 {len(entries)}, 완료 {len(archive_ids)}, 대상 {len(todo)}")
+    log.info(f"전체 {len(entries)}, 완료 {already}, 대상 {len(todo)}")
     if not todo:
         log.info("다운로드할 항목 없음")
         return
@@ -367,13 +351,12 @@ def stage_download(args):
     success = fail = 0
     for entry in tqdm(todo, desc="다운로드"):
         url = entry.get("url", "")
-        vid = str(entry.get("id", ""))
         if not url:
             continue
 
+        # download_single_video 내부에서 DB 기록 처리
         ok = download_single_video(url, lambda s: log.info(f"  {s}"))
         if ok:
-            _mark_archive(vid)
             success += 1
         else:
             fail += 1
@@ -402,10 +385,11 @@ def stage_build_site(args):
 
     log.info(f"카탈로그 {len(videos)}건 로드")
     built = 0
+    from core import get_video_path
     for v in tqdm(videos, desc="HTML 빌드"):
         vid = str(v.get("id", ""))
         cid = v.get("channel_id", "") or "unknown_channel"
-        video_dir = DATA_DIR / cid / vid
+        video_dir = get_video_path(cid, v.get("channel", ""), vid, v.get("title", ""))
         video_dir.mkdir(parents=True, exist_ok=True)
 
         build_html(video_dir, {

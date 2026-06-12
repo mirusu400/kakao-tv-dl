@@ -20,9 +20,9 @@ from tqdm import tqdm
 
 from core import (
     ROOT, STATE_DIR, DATA_DIR,
-    load_cookies, sleep_polite, record_failure,
+    load_cookies, sleep_polite,
     cafe_list_articles, cafe_download_article,
-    _new_session, CAFE_DONE_FILE,
+    _new_session,
 )
 
 # ── 로깅 ────────────────────────────────────────────────────────────────
@@ -84,19 +84,12 @@ def main():
         log.info(f"목록 저장: {list_file}")
         return
 
-    # 2) 이미 완료된 항목 제외
-    done_ids = set()
-    if CAFE_DONE_FILE.exists():
-        done_ids = set(CAFE_DONE_FILE.read_text().splitlines())
-    log.info(f"이미 완료: {len(done_ids)}건")
-
-    # 3) 다운로드
+    # 2) 다운로드 (중복 체크는 cafe_download_article 내부에서 DB로 처리)
     log.info("=" * 60)
     log.info("다운로드 시작")
     log.info("=" * 60)
 
-    import re
-    success = fail = skip = 0
+    success = fail = 0
     for i, article in enumerate(tqdm(articles, desc="카페 다운로드")):
         if args.limit and success >= args.limit:
             log.info(f"제한 도달 ({args.limit}건)")
@@ -106,28 +99,9 @@ def main():
         dataid = article["dataid"]
         log.info(f"[{i + 1}/{len(articles)}] fldid={fldid}, dataid={dataid}")
 
-        # done 체크
-        resp = session.get(
-            f"https://cafe.daum.net/_c21_/bbs_read?grpid={args.grpid}&fldid={fldid}&datanum={dataid}",
-            cookies=cookies, timeout=15,
-        )
-        if resp.status_code == 200:
-            clips_found = re.findall(r'cliplink/([a-zA-Z0-9]+)', resp.text)
-            if clips_found and clips_found[0] in done_ids:
-                log.info(f"  이미 완료 — 스킵")
-                skip += 1
-                sleep_polite()
-                continue
-
         try:
             ok = cafe_download_article(session, cookies, args.grpid, fldid, dataid)
             if ok:
-                # clip_id 기록
-                if resp.status_code == 200 and clips_found:
-                    CAFE_DONE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                    with open(CAFE_DONE_FILE, "a") as f:
-                        f.write(clips_found[0] + "\n")
-                    done_ids.add(clips_found[0])
                 success += 1
             else:
                 fail += 1
@@ -138,7 +112,7 @@ def main():
         sleep_polite()
 
     log.info("=" * 60)
-    log.info(f"완료: 성공 {success}, 실패 {fail}, 스킵 {skip}")
+    log.info(f"완료: 성공 {success}, 실패 {fail}")
     log.info("=" * 60)
 
 
