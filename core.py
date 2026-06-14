@@ -18,6 +18,7 @@ import sys
 import time
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 
@@ -54,6 +55,7 @@ CFG = load_config()
 THROTTLE = CFG.get("throttle", {})
 SLEEP_MIN = THROTTLE.get("sleep_min", 2)
 SLEEP_MAX = THROTTLE.get("sleep_max", 6)
+CONCURRENCY = max(1, int(THROTTLE.get("concurrency", 4)))
 MAX_HEIGHT = CFG.get("quality", {}).get("max_height", 1080)
 EXCLUDE_CHANNELS = set(CFG.get("exclude", {}).get("channels", []))
 EXCLUDE_KEYWORDS = [kw.lower() for kw in CFG.get("exclude", {}).get("keywords", ["뉴스", "news"])]
@@ -692,43 +694,77 @@ def search_and_download(
 #  채널 → 다운로드
 # ═══════════════════════════════════════════════════════════════════════════
 
+def channel_list_videos(channel_id: str) -> list[dict]:
+    """카카오TV 채널 API로 전체 클립 목록 반환 (yt_dlp는 채널 미지원)."""
+    session = _new_session()
+    referer = f"https://tv.kakao.com/channel/{channel_id}/video"
+    out, page = [], 1
+    while True:
+        try:
+            resp = session.get(
+                f"https://tv.kakao.com/api/v1/ft/channels/{channel_id}/videolinks",
+                params={"size": 20, "page": page},
+                headers={"x-requested-with": "XMLHttpRequest", "referer": referer},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.error(f"채널 목록 API 에러 (page {page}): {e}")
+            break
+        clips = data.get("clipLinkList") or []
+        if not clips:
+            break
+        out.extend(clips)
+        if not data.get("hasMore"):
+            break
+        page += 1
+        sleep_polite()
+    return out
+
+
 def channel_download(
     url: str,
     progress_fn=None,
     stop_event: threading.Event | None = None,
 ) -> int:
     """채널 URL의 모든 영상 다운로드. 건수 반환."""
-    import yt_dlp
 
     def _update(s):
         if progress_fn:
             progress_fn(s)
 
-    _update("채널 펼침...")
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
-            data = ydl.extract_info(url, download=False)
-        if data is None:
-            _update("실패 (채널 로드)")
-            return 0
-    except Exception as e:
-        _update(f"실패: {e}")
+    m = re.search(r'channel/(\d+)', url)
+    if not m:
+        _update("실패 (채널 ID 파싱 불가)")
+        return 0
+    channel_id = m.group(1)
+
+    _update("채널 목록 조회...")
+    clips = channel_list_videos(channel_id)
+    if not clips:
+        _update("실패 (영상 없음)")
         return 0
 
-    entries = data.get("entries", [])
-    log.info(f"채널 {url}: {len(entries)}개 영상")
-    done = 0
-    for i, e in enumerate(entries):
+    log.info(f"채널 {channel_id}: {len(clips)}개 영상")
+    total, done = len(clips), 0
+    for i, c in enumerate(clips):
         if stop_event and stop_event.is_set():
             break
-        eid = str(e.get("id", ""))
-        vurl = e.get("url") or e.get("webpage_url") or f"https://tv.kakao.com/v/{eid}"
-        title = e.get("title", "")
-        _update(f"[{i + 1}/{len(entries)}] {title[:25]}...")
+        clip_id = str(c.get("id") or c.get("clipLinkId") or "")
+        if not clip_id:
+            continue
+        ch = c.get("channel") or {}
+        ch_id = str(ch.get("id", "") or channel_id) if isinstance(ch, dict) else channel_id
+        title = c.get("displayTitle") or c.get("title") or ""
+        if should_exclude(title):
+            continue
+        vurl = make_video_url(clip_id, ch_id)
+        _update(f"[{i + 1}/{total}] {title[:25]}...")
         download_single_video(vurl, lambda s: log.info(f"  {s}"), stop_event)
         done += 1
         sleep_polite()
-    _update(f"완료 ({done}/{len(entries)})")
+    _update(f"완료 ({done}/{total})")
     return done
 
 
@@ -846,7 +882,6 @@ def cafe_download_article(
             }
     except Exception:
         pass
-    sleep_polite()
 
     title = meta.get("title", "")
 
@@ -981,21 +1016,37 @@ def cafe_download_all(
         _update("실패: 게시글 없음")
         return 0
 
+    total = len(articles)
     success = 0
-    for i, art in enumerate(articles):
+    done = 0
+    lock = threading.Lock()
+
+    def _worker(art):
+        nonlocal success, done
         if stop_event and stop_event.is_set():
-            break
+            return
         fldid, dataid = art["fldid"], art["dataid"]
-        _update(f"[{i + 1}/{len(articles)}] 게시글 {dataid}...")
+        # 워커마다 독립 세션 (curl_cffi 세션은 스레드 안전하지 않음)
+        sess = _new_session()
+        try:
+            ok = cafe_download_article(sess, cookies, grpid, fldid, dataid)
+            if ok:
+                log.info(f"  [{dataid}] 완료")
+        except Exception as e:
+            log.warning(f"  [{dataid}] 에러: {e}")
+            ok = False
+        with lock:
+            done += 1
+            if ok:
+                success += 1
+            _update(f"[{done}/{total}] 성공 {success}건")
+        sleep_polite()  # 워커별 예의 딜레이
 
-        # cafe_download_article 내부에서 DB 중복 체크 + 완료 기록 처리
-        ok = cafe_download_article(session, cookies, grpid, fldid, dataid)
-        if ok:
-            success += 1
-            log.info(f"  [{dataid}] 완료")
-        sleep_polite()
+    log.info(f"카페 다운로드 시작: {total}건, 동시 {CONCURRENCY}개")
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
+        list(ex.map(_worker, articles))
 
-    _update(f"완료 ({success}/{len(articles)})")
+    _update(f"완료 ({success}/{total})")
     return success
 
 
