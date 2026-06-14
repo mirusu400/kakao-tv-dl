@@ -1,4 +1,4 @@
-throttle: { sleep_min: 2, sleep_max: 6, concurrency: 2 }
+throttle: { sleep_min: 0.5, sleep_max: 1.5, concurrency: 4 }
 quality:  { max_height: 1080 }
 search:   { size: 20, max_pages: 200 }
 exclude:  { channels: [], keywords: ["뉴스", "news"] }
