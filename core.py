@@ -454,24 +454,91 @@ def find_stream_url(vid: str, url: str, profiles: list[str]) -> tuple[str | None
 # ═══════════════════════════════════════════════════════════════════════════
 
 def download_stream(stream_url: str, dest: Path,
-                    stop_event: threading.Event | None = None) -> bool:
-    """스트림 URL에서 mp4 직접 다운로드."""
+                    stop_event: threading.Event | None = None,
+                    progress_fn=None) -> bool:
+    """스트림 URL에서 mp4 파일 다운로드 (세그먼트 Range + 재시도).
+
+    대용량 파일이 중간에 멈춰도 8MB 단위로 끊어 받아 자동 복구한다.
+    .part 파일에 이어받기 후 완료되면 최종 파일로 교체.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    SEG = 8 * 1024 * 1024
     session = _new_session()
+
+    # 전체 크기 파악 (Range 지원 여부 확인)
+    total = None
     try:
-        r = session.get(stream_url, stream=True, timeout=600)
-        if r.status_code not in (200, 206):
-            return False
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(256 * 1024):
-                if stop_event and stop_event.is_set():
-                    return False
-                if chunk:
-                    f.write(chunk)
-        return dest.stat().st_size > 1024
+        r0 = session.get(stream_url, headers={"Range": "bytes=0-0"}, timeout=(15, 30))
+        cr = r0.headers.get("content-range", "")
+        if "/" in cr:
+            total = int(cr.rsplit("/", 1)[-1])
     except Exception as e:
-        log.warning(f"스트림 다운로드 에러: {e}")
-        return False
+        log.warning(f"크기 조회 실패: {e}")
+
+    # Range 미지원 → 단일 스트림 폴백
+    if not total:
+        try:
+            r = session.get(stream_url, stream=True, timeout=(15, 120))
+            if r.status_code not in (200, 206):
+                return False
+            with open(part, "wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if stop_event and stop_event.is_set():
+                        return False
+                    if chunk:
+                        f.write(chunk)
+            part.replace(dest)
+            return dest.stat().st_size > 1024
+        except Exception as e:
+            log.warning(f"스트림 다운로드 실패: {e}")
+            return False
+
+    # 이어받기 위치 결정
+    have = part.stat().st_size if part.exists() else 0
+    if have > total:
+        part.unlink(missing_ok=True)
+        have = 0
+
+    with open(part, "ab" if have else "wb") as f:
+        while have < total:
+            if stop_event and stop_event.is_set():
+                return False
+            end = min(have + SEG, total) - 1
+            ok = False
+            for attempt in range(6):
+                try:
+                    r = session.get(
+                        stream_url,
+                        headers={"Range": f"bytes={have}-{end}"},
+                        stream=True, timeout=(15, 60),
+                    )
+                    if r.status_code == 200 and have > 0:
+                        raise IOError("서버가 Range 무시(200)")
+                    if r.status_code not in (200, 206):
+                        raise IOError(f"HTTP {r.status_code}")
+                    for chunk in r.iter_content(1024 * 1024):
+                        if stop_event and stop_event.is_set():
+                            f.flush()
+                            return False
+                        if chunk:
+                            f.write(chunk)
+                            have += len(chunk)
+                            if progress_fn:
+                                progress_fn(have, total)
+                    ok = True
+                    break
+                except Exception as e:
+                    f.flush()
+                    have = part.stat().st_size  # 부분 기록 반영
+                    log.warning(f"세그먼트 재시도 {attempt + 1}/6 @{have}/{total}: {e}")
+                    time.sleep(min(2 * (attempt + 1), 10))
+            if not ok:
+                log.warning(f"세그먼트 실패로 중단: {have}/{total}")
+                return False
+
+    part.replace(dest)
+    return dest.exists() and dest.stat().st_size > 1024
 
 
 def download_file(url: str, dest: Path, timeout: int = 15) -> bool:
